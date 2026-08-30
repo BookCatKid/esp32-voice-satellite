@@ -2,6 +2,7 @@
 import asyncio
 import collections
 import io
+import hmac
 import json
 import math
 import os
@@ -14,6 +15,8 @@ import uuid
 import wave
 from pathlib import Path
 
+from aiohttp import web, WSMsgType
+
 import numpy as np
 import miniaudio
 from openwakeword.model import Model as WakeWordModel
@@ -24,8 +27,8 @@ FRAME_SAMPLES = 320
 FRAME_BYTES = FRAME_SAMPLES * 2
 FRAME_MS = 20
 
-AUDIO_PORT = int(os.getenv("AUDIO_PORT", "8765"))
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8766"))
+SATELLITE_PROTOCOL = "voice-satellite.v1"
 SATELLITE_TOKEN = os.environ["SATELLITE_TOKEN"]
 STT_BASE = os.getenv("STT_BASE", "http://stt-guard:8890/v1").rstrip("/")
 OPENWEBUI_BASE = os.getenv("OPENWEBUI_BASE", "http://open-webui:8080").rstrip("/")
@@ -91,9 +94,19 @@ last_tts_audio = b""
 utterance_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=3)
 wake_model = None
 wake_armed_until = 0.0
-speaker_writer = None
-speaker_send_lock = None
+satellite_ws = None
+satellite_send_lock = None
+playback_task = None
+playback_serial = 0
 speaker_playing_until = 0.0
+
+status.update({
+    "transport": "websocket",
+    "protocol": SATELLITE_PROTOCOL,
+    "device_id": None,
+    "firmware": None,
+    "rssi": None,
+})
 
 
 def extract_agent_text(output):
@@ -305,52 +318,57 @@ def tts_to_pcm(audio_bytes: bytes):
     return bytes(decoded.samples)
 
 
-async def speaker_send(command: bytes, payload: bytes = b""):
-    """Send one atomic control/playback message to the authenticated speaker socket."""
-    global speaker_writer
-    if speaker_writer is None or speaker_send_lock is None:
+async def satellite_send_json(payload):
+    global satellite_ws
+    ws = satellite_ws
+    if ws is None or ws.closed or satellite_send_lock is None:
         return False
-    async with speaker_send_lock:
-        writer = speaker_writer
-        if writer is None:
-            return False
-        try:
-            writer.write(command)
-            if payload:
-                writer.write(payload)
-            await writer.drain()
-            return True
-        except (ConnectionError, BrokenPipeError):
-            if speaker_writer is writer:
-                speaker_writer = None
-                status["speaker_connected"] = False
-            return False
+    try:
+        async with satellite_send_lock:
+            if ws is not satellite_ws or ws.closed:
+                return False
+            await ws.send_json(payload)
+        return True
+    except (ConnectionError, RuntimeError):
+        if satellite_ws is ws:
+            satellite_ws = None
+            status["connected"] = False
+            status["speaker_connected"] = False
+        return False
+
+
+async def satellite_send_bytes(payload: bytes):
+    global satellite_ws
+    ws = satellite_ws
+    if ws is None or ws.closed or satellite_send_lock is None:
+        return False
+    try:
+        async with satellite_send_lock:
+            if ws is not satellite_ws or ws.closed:
+                return False
+            await ws.send_bytes(payload)
+        return True
+    except (ConnectionError, RuntimeError):
+        if satellite_ws is ws:
+            satellite_ws = None
+            status["connected"] = False
+            status["speaker_connected"] = False
+        return False
 
 
 async def set_speaker_volume(volume: int):
     volume = max(0, min(100, int(volume)))
     status["speaker_volume"] = volume
-    # Volume is applied to PCM on the Pi before transmission.  Keep the
-    # satellite-side gain at unity so a firmware-side volume bug cannot make
-    # the dashboard slider ineffective (or cause us to attenuate twice).
-    await speaker_send(b"VOLUME 100\n")
+    await satellite_send_json({"type": "volume", "value": volume})
     return volume
 
 
 def apply_speaker_volume(pcm: bytes, volume: int):
-    """Apply a perceptual-ish software gain curve to little-endian PCM16.
-
-    Doing this before the audio leaves the Pi makes the volume control
-    authoritative even if the ESP32 ignores its VOLUME control message.
-    A quadratic curve gives useful control at the very quiet end where the
-    MAX98357A + small speaker combination is otherwise surprisingly loud.
-    """
     volume = max(0, min(100, int(volume)))
     if not pcm or volume >= 100:
         return pcm
     if volume == 0:
         return bytes(len(pcm))
-
     gain = (volume / 100.0) ** 2
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.int32)
     samples = np.rint(samples * gain)
@@ -359,12 +377,6 @@ def apply_speaker_volume(pcm: bytes, volume: int):
 
 
 def make_diagnostic_tone(peak: int, duration_ms: int = 600, frequency_hz: float = 440.0):
-    """Generate a deliberately tiny PCM16 sine for speaker-path diagnostics.
-
-    This bypasses the dashboard volume curve so we can prove what exact sample
-    magnitude reaches the ESP32.  Keep this capped very low; it is a temporary
-    diagnostic endpoint, not a user-facing speaker-test feature.
-    """
     peak = max(0, min(64, int(peak)))
     count = max(1, int(SAMPLE_RATE * duration_ms / 1000))
     if peak == 0:
@@ -374,20 +386,51 @@ def make_diagnostic_tone(peak: int, duration_ms: int = 600, frequency_hz: float 
     return samples.astype("<i2").tobytes()
 
 
-async def play_on_satellite(pcm: bytes):
+async def _stream_playback(play_id: str, pcm: bytes, duration_ms: int):
     global speaker_playing_until
-    if not pcm:
+    try:
+        started = await satellite_send_json({
+            "type": "playback.start",
+            "id": play_id,
+            "audio": {"codec": "pcm_s16le", "sample_rate": SAMPLE_RATE, "channels": 1, "frame_ms": FRAME_MS},
+            "bytes": len(pcm),
+            "duration_ms": duration_ms,
+        })
+        if not started:
+            return
+        status["speaker_playing"] = True
+        speaker_playing_until = time.monotonic() + duration_ms / 1000.0 + 0.25
+        for offset in range(0, len(pcm), FRAME_BYTES):
+            frame = pcm[offset:offset + FRAME_BYTES]
+            if not await satellite_send_bytes(frame):
+                return
+            status["speaker_bytes_sent"] += len(frame)
+            await asyncio.sleep(FRAME_MS / 1000.0)
+        await satellite_send_json({"type": "playback.end", "id": play_id})
+    except asyncio.CancelledError:
+        await satellite_send_json({"type": "playback.cancel", "id": play_id})
+        raise
+    finally:
+        status["speaker_playing"] = False
+
+
+async def play_on_satellite(pcm: bytes):
+    global playback_task, playback_serial
+    if not pcm or satellite_ws is None or satellite_ws.closed or not status.get("speaker_connected"):
         return False
     pcm = apply_speaker_volume(pcm, status["speaker_volume"])
     duration_ms = len(pcm) * 1000 // (SAMPLE_RATE * 2)
-    sent = await speaker_send(f"PLAY {len(pcm)}\n".encode(), pcm)
-    if sent:
-        status["speaker_playback_ms"] = duration_ms
-        status["speaker_bytes_sent"] += len(pcm)
-        speaker_playing_until = time.monotonic() + duration_ms / 1000.0 + 0.20
-        status["speaker_playing"] = True
-    return sent
-
+    status["speaker_playback_ms"] = duration_ms
+    if playback_task is not None and not playback_task.done():
+        playback_task.cancel()
+        try:
+            await playback_task
+        except asyncio.CancelledError:
+            pass
+    playback_serial += 1
+    play_id = f"play-{playback_serial}"
+    playback_task = asyncio.create_task(_stream_playback(play_id, pcm, duration_ms))
+    return True
 
 def add_history(transcript, response, started_ms, stt_ms, agent_ms, tts_ms):
     item = {
@@ -471,40 +514,51 @@ async def process_utterances():
             status["processing"] = False
 
 
-async def handle_audio(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    global wake_armed_until, speaker_writer, speaker_playing_until
-    peer = writer.get_extra_info("peername")
-    is_speaker_connection = False
+async def handle_satellite_ws(request: web.Request):
+    global wake_armed_until, satellite_ws, speaker_playing_until
+    auth = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not auth.startswith(prefix) or not hmac.compare_digest(auth[len(prefix):], SATELLITE_TOKEN):
+        raise web.HTTPUnauthorized(headers={"WWW-Authenticate": "Bearer"})
+
+    offered = [x.strip() for x in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if x.strip()]
+    if SATELLITE_PROTOCOL not in offered:
+        return web.json_response({"error": "unsupported websocket subprotocol", "required": SATELLITE_PROTOCOL}, status=426)
+
+    ws = web.WebSocketResponse(protocols=(SATELLITE_PROTOCOL,), heartbeat=20.0, autoping=True, max_msg_size=2 * 1024 * 1024)
+    await ws.prepare(request)
     try:
-        line = await asyncio.wait_for(reader.readline(), timeout=5)
-        expected_mic = ("AUTH " + SATELLITE_TOKEN + "\n").encode()
-        expected_speaker = ("AUTH " + SATELLITE_TOKEN + " SPEAKER\n").encode()
-        if line not in (expected_mic, expected_speaker):
-            writer.write(b"ERR auth\n")
-            await writer.drain()
-            return
-        writer.write(b"OK\n")
-        await writer.drain()
+        hello_msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+        if hello_msg.type != WSMsgType.TEXT:
+            await ws.close(code=1002, message=b"hello required")
+            return ws
+        try:
+            hello = json.loads(hello_msg.data)
+        except json.JSONDecodeError:
+            await ws.close(code=1007, message=b"invalid hello json")
+            return ws
 
-        if line == expected_speaker:
-            is_speaker_connection = True
-            old_writer = speaker_writer
-            speaker_writer = writer
-            status["speaker_connected"] = True
-            if old_writer is not None and old_writer is not writer:
-                old_writer.close()
-            await set_speaker_volume(status["speaker_volume"])
-            # The ESP32 doesn't need to send application data on this socket;
-            # this read simply lets us detect when it disconnects.
-            await reader.read()
-            return
+        audio_in = hello.get("audio_in") or {}
+        if (hello.get("type") != "hello" or int(hello.get("protocol", 0)) != 1 or
+            audio_in.get("codec") != "pcm_s16le" or int(audio_in.get("sample_rate", 0)) != SAMPLE_RATE or
+            int(audio_in.get("channels", 0)) != 1):
+            await ws.send_json({"type": "error", "code": "unsupported_hello", "required": {"protocol": 1, "audio_in": {"codec": "pcm_s16le", "sample_rate": SAMPLE_RATE, "channels": 1}}})
+            await ws.close(code=1003, message=b"unsupported audio format")
+            return ws
 
-        status.update({
-            "connected": True,
-            "peer": peer[0] if peer else None,
-            "connected_at": int(time.time()),
-            "last_error": "",
-        })
+        old = satellite_ws
+        satellite_ws = ws
+        if old is not None and old is not ws and not old.closed:
+            await old.close(code=1001, message=b"replaced by new satellite connection")
+
+        capabilities = set(hello.get("capabilities") or [])
+        device = hello.get("device") or {}
+        status.update({"connected": True, "speaker_connected": "speaker" in capabilities, "peer": request.remote,
+                       "connected_at": int(time.time()), "last_error": "", "device_id": device.get("id"),
+                       "firmware": device.get("firmware"), "rssi": None})
+        await ws.send_json({"type": "ready", "protocol": 1, "server": "voice-satellite", "volume": status["speaker_volume"],
+                            "wake": {"mode": "server", "label": WAKEWORD_LABEL},
+                            "audio_out": {"codec": "pcm_s16le", "sample_rate": SAMPLE_RATE, "channels": 1, "frame_ms": FRAME_MS}})
 
         pre_roll = collections.deque(maxlen=15)
         speech_frames = []
@@ -515,243 +569,167 @@ async def handle_audio(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         noise_db = status.get("noise_dbfs", -72.0)
         wake_bytes = bytearray()
         wake_hit_cooldown_until = 0.0
-
+        rx_buffer = bytearray()
         if wake_model is not None:
             wake_model.reset()
 
-        while True:
-            frame = await reader.readexactly(FRAME_BYTES)
-            dbfs, peak_dbfs = frame_level(frame)
-            status["last_frame_at"] = time.time()
-            status["bytes_received"] += len(frame)
-            status["dbfs"] = round(dbfs, 1)
-            status["peak_dbfs"] = round(peak_dbfs, 1)
-
-            # Do not let the satellite hear its own TTS and recursively trigger
-            # another request. Keep the transport flowing, but suspend wake/VAD
-            # while speaker playback is in progress plus a short tail.
-            if time.monotonic() < speaker_playing_until:
-                status["speaker_playing"] = True
-                status["speaking"] = False
-                pre_roll.clear()
-                speech_frames = []
-                voiced_run = 0
-                silence_ms = 0
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                try:
+                    event = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("type")
+                if kind == "stats":
+                    status["rssi"] = event.get("rssi")
+                    if event.get("firmware"):
+                        status["firmware"] = event.get("firmware")
+                elif kind == "playback.done":
+                    status["speaker_playing"] = False
+                elif kind == "ping":
+                    await ws.send_json({"type": "pong", "t": event.get("t")})
                 continue
-            status["speaker_playing"] = False
+            if msg.type != WSMsgType.BINARY:
+                if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                    break
+                continue
 
-            # openWakeWord works naturally in 80 ms / 1280-sample chunks.
-            # The ESP stream arrives in 20 ms frames, so aggregate four.
-            if wake_model is not None:
-                wake_bytes.extend(frame)
-                while len(wake_bytes) >= 2560:
-                    wake_chunk = bytes(wake_bytes[:2560])
-                    del wake_bytes[:2560]
-                    predictions = wake_model.predict(np.frombuffer(wake_chunk, dtype=np.int16))
-                    score = float(predictions.get(WAKEWORD_MODEL, 0.0))
-                    status["wake_score"] = round(score, 4)
-                    now_mono = time.monotonic()
-                    if score >= WAKEWORD_THRESHOLD and now_mono >= wake_hit_cooldown_until:
-                        wake_armed_until = now_mono + WAKEWORD_ARM_SECONDS
-                        wake_hit_cooldown_until = now_mono + 2.5
-                        status["wake_hits"] += 1
-                        status["last_wake_at"] = int(time.time())
-                        if speaking:
-                            utterance_authorized = True
+            rx_buffer.extend(msg.data)
+            while len(rx_buffer) >= FRAME_BYTES:
+                frame = bytes(rx_buffer[:FRAME_BYTES])
+                del rx_buffer[:FRAME_BYTES]
+                dbfs, peak_dbfs = frame_level(frame)
+                status["last_frame_at"] = time.time()
+                status["bytes_received"] += len(frame)
+                status["dbfs"] = round(dbfs, 1)
+                status["peak_dbfs"] = round(peak_dbfs, 1)
 
-            if not speaking and dbfs < noise_db + 6:
-                noise_db = noise_db * 0.985 + dbfs * 0.015
-            threshold = min(-38.0, max(-60.0, noise_db + 10.0))
-            status["noise_dbfs"] = round(noise_db, 1)
-            status["vad_threshold_dbfs"] = round(threshold, 1)
-            pre_roll.append(frame)
-
-            if not speaking:
-                if dbfs > threshold:
-                    voiced_run += 1
-                else:
-                    voiced_run = max(0, voiced_run - 1)
-                if voiced_run >= 3:
-                    speaking = True
-                    status["speaking"] = True
-                    speech_frames = list(pre_roll)
-                    utterance_authorized = time.monotonic() < wake_armed_until
-                    silence_ms = 0
-            else:
-                speech_frames.append(frame)
-                end_threshold = min(-42.0, max(-64.0, noise_db + 6.0))
-                if dbfs < end_threshold:
-                    silence_ms += FRAME_MS
-                else:
-                    silence_ms = 0
-
-                duration_ms = len(speech_frames) * FRAME_MS
-                if silence_ms >= 700 or duration_ms >= 15000:
-                    speaking = False
+                if time.monotonic() < speaker_playing_until:
+                    status["speaker_playing"] = True
                     status["speaking"] = False
-                    voiced_run = 0
-                    # Keep only ~200 ms of trailing silence.
-                    trim = max(0, (silence_ms - 200) // FRAME_MS)
-                    if trim:
-                        speech_frames = speech_frames[:-trim]
-                    pcm = b"".join(speech_frames)
-                    duration_ms = len(pcm) * 1000 // (SAMPLE_RATE * 2)
-                    status["last_utterance_ms"] = duration_ms
-                    status["utterances"] += 1
-                    if duration_ms >= 250:
-                        if wake_model is not None and utterance_authorized:
-                            try:
-                                utterance_queue.put_nowait(pcm)
-                            except asyncio.QueueFull:
-                                status["last_error"] = "Utterance queue full; dropped audio"
-                        else:
-                            status["ignored_utterances"] += 1
-                    status["queue_depth"] = utterance_queue.qsize()
-                    speech_frames = []
-                    utterance_authorized = False
-    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
-        pass
+                    pre_roll.clear(); speech_frames = []; voiced_run = 0; silence_ms = 0
+                    continue
+                status["speaker_playing"] = False
+
+                if wake_model is not None:
+                    wake_bytes.extend(frame)
+                    while len(wake_bytes) >= 2560:
+                        wake_chunk = bytes(wake_bytes[:2560]); del wake_bytes[:2560]
+                        predictions = wake_model.predict(np.frombuffer(wake_chunk, dtype=np.int16))
+                        score = float(predictions.get(WAKEWORD_MODEL, 0.0))
+                        status["wake_score"] = round(score, 4)
+                        now_mono = time.monotonic()
+                        if score >= WAKEWORD_THRESHOLD and now_mono >= wake_hit_cooldown_until:
+                            wake_armed_until = now_mono + WAKEWORD_ARM_SECONDS
+                            wake_hit_cooldown_until = now_mono + 2.5
+                            status["wake_hits"] += 1
+                            status["last_wake_at"] = int(time.time())
+                            if speaking:
+                                utterance_authorized = True
+
+                if not speaking and dbfs < noise_db + 6:
+                    noise_db = noise_db * 0.985 + dbfs * 0.015
+                threshold = min(-38.0, max(-60.0, noise_db + 10.0))
+                status["noise_dbfs"] = round(noise_db, 1)
+                status["vad_threshold_dbfs"] = round(threshold, 1)
+                pre_roll.append(frame)
+
+                if not speaking:
+                    if dbfs > threshold: voiced_run += 1
+                    else: voiced_run = max(0, voiced_run - 1)
+                    if voiced_run >= 3:
+                        speaking = True; status["speaking"] = True; speech_frames = list(pre_roll)
+                        utterance_authorized = time.monotonic() < wake_armed_until; silence_ms = 0
+                else:
+                    speech_frames.append(frame)
+                    end_threshold = min(-42.0, max(-64.0, noise_db + 6.0))
+                    silence_ms = silence_ms + FRAME_MS if dbfs < end_threshold else 0
+                    duration_ms = len(speech_frames) * FRAME_MS
+                    if silence_ms >= 700 or duration_ms >= 15000:
+                        speaking = False; status["speaking"] = False; voiced_run = 0
+                        trim = max(0, (silence_ms - 200) // FRAME_MS)
+                        if trim: speech_frames = speech_frames[:-trim]
+                        pcm = b"".join(speech_frames)
+                        duration_ms = len(pcm) * 1000 // (SAMPLE_RATE * 2)
+                        status["last_utterance_ms"] = duration_ms; status["utterances"] += 1
+                        if duration_ms >= 250:
+                            if wake_model is not None and utterance_authorized:
+                                try: utterance_queue.put_nowait(pcm)
+                                except asyncio.QueueFull: status["last_error"] = "Utterance queue full; dropped audio"
+                            else: status["ignored_utterances"] += 1
+                        status["queue_depth"] = utterance_queue.qsize(); speech_frames = []; utterance_authorized = False
+    except asyncio.TimeoutError:
+        await ws.close(code=1002, message=b"hello timeout")
     except Exception as exc:
-        status["last_error"] = "audio socket: " + str(exc)[:300]
+        status["last_error"] = "websocket: " + str(exc)[:300]
     finally:
-        if is_speaker_connection:
-            if speaker_writer is writer:
-                speaker_writer = None
-                status["speaker_connected"] = False
-        else:
-            status["connected"] = False
-            status["speaking"] = False
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+        if satellite_ws is ws:
+            satellite_ws = None
+            status["connected"] = False; status["speaker_connected"] = False; status["speaking"] = False; status["speaker_playing"] = False
+    return ws
 
+async def dashboard_handler(request: web.Request):
+    return web.Response(body=DASHBOARD, content_type="text/html", charset="utf-8")
 
-def json_bytes(obj):
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+async def health_handler(request: web.Request):
+    return web.json_response({"ok": True, "transport": "websocket", "protocol": SATELLITE_PROTOCOL, "agent_ready": status["agent_ready"], "wake_ready": status["wake_ready"]})
 
+async def status_handler(request: web.Request):
+    payload = dict(status); payload["uptime_s"] = int(time.time() - STARTED); payload["wake_armed"] = time.monotonic() < wake_armed_until
+    return web.json_response(payload)
 
-async def http_reply(writer, code, body, content_type="text/plain; charset=utf-8", extra=None):
-    reasons = {200: "OK", 404: "Not Found", 405: "Method Not Allowed", 503: "Service Unavailable"}
-    headers = {
-        "Content-Type": content_type,
-        "Content-Length": str(len(body)),
-        "Cache-Control": "no-store",
-        "Connection": "close",
-    }
-    if extra:
-        headers.update(extra)
-    head = f"HTTP/1.1 {code} {reasons.get(code, 'OK')}\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items()) + "\r\n"
-    writer.write(head.encode() + body)
-    await writer.drain()
+async def audio_handler(request: web.Request):
+    if not last_tts_audio: raise web.HTTPNotFound(text="no audio")
+    return web.Response(body=last_tts_audio, content_type="audio/mpeg", headers={"Cache-Control": "no-store"})
 
-
-async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+async def volume_handler(request: web.Request):
     try:
-        line = await asyncio.wait_for(reader.readline(), timeout=5)
-        if not line:
-            return
-        parts = line.decode("latin1").strip().split()
-        if len(parts) < 2:
-            return
-        method, path = parts[0], parts[1].split("?", 1)[0]
-        while True:
-            h = await reader.readline()
-            if h in (b"\r\n", b"\n", b""):
-                break
+        volume = int(request.match_info["volume"])
+        if not 0 <= volume <= 100: raise ValueError
+    except ValueError: raise web.HTTPBadRequest(text="volume must be 0..100")
+    return web.json_response({"ok": True, "volume": await set_speaker_volume(volume)})
 
-        if method == "POST" and path.startswith("/api/volume/"):
-            try:
-                volume = int(path.rsplit("/", 1)[-1])
-                if not 0 <= volume <= 100:
-                    raise ValueError
-                volume = await set_speaker_volume(volume)
-                await http_reply(writer, 200, json_bytes({"ok": True, "volume": volume}), "application/json")
-            except ValueError:
-                await http_reply(writer, 400, b"volume must be 0..100")
-        elif method == "POST" and path.startswith("/api/diagnostic-tone/"):
-            try:
-                peak = int(path.rsplit("/", 1)[-1])
-                if not 0 <= peak <= 64:
-                    raise ValueError
-                pcm = make_diagnostic_tone(peak)
-                sent = await speaker_send(f"PLAY {len(pcm)}\n".encode(), pcm)
-                await http_reply(
-                    writer,
-                    200 if sent else 503,
-                    json_bytes({"ok": bool(sent), "peak": peak, "samples": len(pcm) // 2}),
-                    "application/json",
-                )
-            except ValueError:
-                await http_reply(writer, 400, b"diagnostic peak must be 0..64")
-        elif method != "GET":
-            await http_reply(writer, 405, b"method not allowed")
-        elif path == "/":
-            await http_reply(writer, 200, DASHBOARD, "text/html; charset=utf-8")
-        elif path == "/health":
-            await http_reply(writer, 200, b"ok\n")
-        elif path == "/api/status":
-            payload = dict(status)
-            payload["uptime_s"] = int(time.time() - STARTED)
-            payload["wake_armed"] = time.monotonic() < wake_armed_until
-            await http_reply(writer, 200, json_bytes(payload), "application/json")
-        elif path == "/api/audio":
-            if last_tts_audio:
-                await http_reply(writer, 200, last_tts_audio, "audio/mpeg")
-            else:
-                await http_reply(writer, 404, b"no audio")
-        else:
-            await http_reply(writer, 404, b"not found")
-    except Exception:
-        pass
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+async def diagnostic_tone_handler(request: web.Request):
+    try:
+        peak = int(request.match_info["peak"])
+        if not 0 <= peak <= 64: raise ValueError
+    except ValueError: raise web.HTTPBadRequest(text="diagnostic peak must be 0..64")
+    pcm = make_diagnostic_tone(peak); sent = await play_on_satellite(pcm)
+    return web.json_response({"ok": bool(sent), "peak": peak, "samples": len(pcm) // 2}, status=200 if sent else 503)
 
+async def protocol_handler(request: web.Request):
+    return web.json_response({"websocket": "/ws/satellite", "subprotocol": SATELLITE_PROTOCOL,
+        "authentication": "Authorization: Bearer <satellite-token>",
+        "hello": {"type": "hello", "protocol": 1, "device": {"id": "string", "firmware": "string"},
+                  "capabilities": ["microphone", "speaker"],
+                  "audio_in": {"codec": "pcm_s16le", "sample_rate": SAMPLE_RATE, "channels": 1, "frame_ms": FRAME_MS}},
+        "binary": {"client_to_server": "microphone PCM frames", "server_to_client": "speaker PCM frames between playback.start/end events"}})
 
 async def main():
-    global wake_model, speaker_send_lock
-    speaker_send_lock = asyncio.Lock()
+    global wake_model, satellite_send_lock
+    satellite_send_lock = asyncio.Lock()
     try:
-        wake_model = WakeWordModel(
-            wakeword_models=[WAKEWORD_MODEL],
-            inference_framework="onnx",
-        )
-        status["wake_ready"] = True
-        status["wake_error"] = ""
+        wake_model = WakeWordModel(wakeword_models=[WAKEWORD_MODEL], inference_framework="onnx")
+        status["wake_ready"] = True; status["wake_error"] = ""
     except Exception as exc:
-        # Fail closed: without a working wake detector, no utterance is ever
-        # queued for STT/agent processing.
-        wake_model = None
-        status["wake_ready"] = False
-        status["wake_error"] = str(exc)[:300]
-
-    # Validate the service chat eagerly so configuration problems are visible
-    # on the dashboard before the first spoken request.
+        wake_model = None; status["wake_ready"] = False; status["wake_error"] = str(exc)[:300]
     try:
-        if not OPENWEBUI_CHAT_ID:
-            raise RuntimeError("OPENWEBUI_CHAT_ID is not configured")
-        await asyncio.to_thread(
-            http_get_json,
-            OPENWEBUI_BASE + "/api/v1/chats/" + OPENWEBUI_CHAT_ID,
-            {"Authorization": "Bearer " + OPENWEBUI_API_KEY},
-            20,
-        )
+        if not OPENWEBUI_CHAT_ID: raise RuntimeError("OPENWEBUI_CHAT_ID is not configured")
+        await asyncio.to_thread(http_get_json, OPENWEBUI_BASE + "/api/v1/chats/" + OPENWEBUI_CHAT_ID,
+                                {"Authorization": "Bearer " + OPENWEBUI_API_KEY}, 20)
         status["agent_ready"] = True
     except Exception as exc:
-        status["agent_ready"] = False
-        status["last_error"] = "Open WebUI agent: " + str(exc)[:300]
+        status["agent_ready"] = False; status["last_error"] = "Open WebUI agent: " + str(exc)[:300]
     asyncio.create_task(process_utterances())
-    audio = await asyncio.start_server(handle_audio, "0.0.0.0", AUDIO_PORT)
-    http = await asyncio.start_server(handle_http, "0.0.0.0", HTTP_PORT)
-    print(f"voice-satellite receiver: audio={AUDIO_PORT} dashboard={HTTP_PORT}", flush=True)
-    async with audio, http:
-        await asyncio.gather(audio.serve_forever(), http.serve_forever())
-
+    app = web.Application(client_max_size=2 * 1024 * 1024)
+    app.router.add_get("/", dashboard_handler); app.router.add_get("/health", health_handler)
+    app.router.add_get("/api/status", status_handler); app.router.add_get("/api/audio", audio_handler)
+    app.router.add_get("/api/protocol", protocol_handler); app.router.add_post("/api/volume/{volume}", volume_handler)
+    app.router.add_post("/api/diagnostic-tone/{peak}", diagnostic_tone_handler); app.router.add_get("/ws/satellite", handle_satellite_ws)
+    runner = web.AppRunner(app, access_log=None); await runner.setup(); site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT); await site.start()
+    print(f"voice-satellite: http={HTTP_PORT} websocket=/ws/satellite protocol={SATELLITE_PROTOCOL}", flush=True)
+    try: await asyncio.Event().wait()
+    finally: await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -7,6 +7,5 @@
 #define WIFI_PASSWORD "your-wifi-password"
 #define SATELLITE_TOKEN "generate-a-long-random-token"
 
-/* Current firmware uses inet_pton(), so use the Pi's LAN IPv4 address. */
-#define SATELLITE_SERVER_HOST "192.168.1.100"
-#define SATELLITE_SERVER_PORT 8765
+/* The receiver exposes its WebSocket on the Pi's LAN address. */
+#define SATELLITE_SERVER_URI "ws://192.168.1.100:8766/ws/satellite"
