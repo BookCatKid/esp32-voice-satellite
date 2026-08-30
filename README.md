@@ -1,6 +1,6 @@
 # ESP32-S3 Voice Satellite
 
-A small ESP32-S3 voice satellite for the existing Pi 5 voice-assistant stack. The XIAO captures an INMP441 microphone, streams 16 kHz mono audio to the Pi, and plays assistant PCM through a MAX98357A. The Pi handles wake word, VAD, STT, the Open WebUI Voice Assistant agent, and TTS.
+A small input-only ESP32-S3 voice satellite for the existing Pi 5 voice-assistant stack. The XIAO captures an INMP441 microphone and streams 16 kHz mono PCM to the Pi. The Pi handles wake word, VAD, STT, the Open WebUI Voice Assistant agent, and optional TTS for the web dashboard.
 
 ## Hardware
 
@@ -9,15 +9,12 @@ A small ESP32-S3 voice satellite for the existing Pi 5 voice-assistant stack. Th
 | Microphone BCLK | INMP441 SCK | D8 | 7 |
 | Microphone LRCLK | INMP441 WS | D9 | 8 |
 | Microphone data | INMP441 SD | D7 | 44 |
-| Speaker BCLK | MAX98357A BCLK | D8 | 7 |
-| Speaker LRCLK | MAX98357A LRC | D9 | 8 |
-| Speaker data | MAX98357A DIN | D6 | 43 |
 
 The INMP441 channel is detected automatically at boot. The tested module is active on the left I2S slot.
 
 ## Transport
 
-There is no private byte-stream protocol. Firmware and receiver communicate over one RFC 6455 WebSocket:
+Firmware and receiver communicate over one authenticated RFC 6455 WebSocket:
 
 ```text
 ESP32-S3                                    Pi 5
@@ -28,9 +25,6 @@ ESP32-S3                                    Pi 5
    │<──────────────────────────── JSON ready ─┤
    │                                          │
    ├── binary PCM16 mic frames ──────────────>│ wake/VAD → STT → agent
-   │                                          │
-   │<──────────── JSON playback.start + PCM ──┤ TTS
-   │<──────────────────── JSON playback.end ──┤
    └── JSON stats / standard ping-pong ──────>│
 ```
 
@@ -39,17 +33,17 @@ The receiver serves everything from port `8766`:
 - `/` — dashboard
 - `/health` — health JSON
 - `/api/status` — live satellite/pipeline state
-- `/api/audio` — last generated TTS audio
+- `/api/audio` — last generated TTS audio for the browser dashboard
 - `/api/protocol` — machine-readable transport description
-- `/ws/satellite` — authenticated WebSocket media/control endpoint
+- `/ws/satellite` — authenticated microphone WebSocket endpoint
 
-See [PROTOCOL.md](PROTOCOL.md) for the small application message schema. WebSocket itself provides message boundaries, fragmentation, ping/pong, reconnect behavior and TCP backpressure; we do not layer our own lengths or line commands on top.
+See [PROTOCOL.md](PROTOCOL.md) for the application message schema.
 
 ## Audio pipeline
 
 ```text
 INMP441
-  → ESP32-S3 I2S
+  → ESP32-S3 I2S RX
   → PCM16 / 16 kHz / mono
   → WebSocket
   → Pi openWakeWord (Hey Jarvis)
@@ -57,13 +51,7 @@ INMP441
   → existing stt-guard / Groq Whisper
   → Open WebUI Voice Assistant workspace
   → existing Home Assistant + web tools
-  → Edge TTS
-  → PCM16 WebSocket downlink
-  → ESP32-S3 I2S
-  → MAX98357A
 ```
-
-Microphone uplink is muted while the local speaker is playing. That prevents the assistant from recursively hearing itself until proper echo cancellation is added.
 
 ## Configuration
 
