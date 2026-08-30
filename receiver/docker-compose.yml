@@ -1,0 +1,27 @@
+services:
+  voice-satellite:
+    build: .
+    container_name: voice-satellite
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AUDIO_PORT: "8765"
+      HTTP_PORT: "8766"
+      STT_BASE: http://stt-guard:8890/v1
+      OPENWEBUI_BASE: http://open-webui:8080
+      OPENWEBUI_MODEL: voice-assistant-ui
+      WAKEWORD_MODEL: hey_jarvis
+      WAKEWORD_LABEL: Hey Jarvis
+      WAKEWORD_THRESHOLD: "0.50"
+      WAKEWORD_ARM_SECONDS: "8"
+      SPEAKER_VOLUME_DEFAULT: "1"
+    ports:
+      - "8765:8765"
+      - "8766:8766"
+    networks:
+      - ai-stack
+
+networks:
+  ai-stack:
+    external: true
