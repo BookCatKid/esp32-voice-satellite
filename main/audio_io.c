@@ -15,6 +15,10 @@ static const char *TAG = "satellite-audio";
 static i2s_chan_handle_t s_rx_channel;
 static i2s_chan_handle_t s_tx_channel;
 static bool s_use_right_channel;
+/* Frame-sized DMA scratch belongs to the audio module, not to whichever task
+ * calls it. In particular, ESP-IDF's main task has only a 3.5 KiB stack. */
+static int32_t s_rx_raw[AUDIO_FRAME_SAMPLES * 2];
+static int16_t s_tx_stereo[AUDIO_FRAME_SAMPLES * 2];
 
 
 esp_err_t audio_io_init(void)
@@ -84,7 +88,6 @@ esp_err_t audio_io_init(void)
 
 void audio_io_detect_microphone_channel(void)
 {
-    int32_t raw[AUDIO_FRAME_SAMPLES * 2];
     uint64_t left_energy = 0;
     uint64_t right_energy = 0;
 
@@ -92,16 +95,16 @@ void audio_io_detect_microphone_channel(void)
         size_t bytes = 0;
         if (i2s_channel_read(
                 s_rx_channel,
-                raw,
-                sizeof(raw),
+                s_rx_raw,
+                sizeof(s_rx_raw),
                 &bytes,
                 pdMS_TO_TICKS(1000)) != ESP_OK) {
             continue;
         }
         const size_t frames = bytes / (sizeof(int32_t) * 2);
         for (size_t i = 0; i < frames; ++i) {
-            left_energy += (uint64_t)llabs(raw[i * 2] >> 8);
-            right_energy += (uint64_t)llabs(raw[i * 2 + 1] >> 8);
+            left_energy += (uint64_t)llabs(s_rx_raw[i * 2] >> 8);
+            right_energy += (uint64_t)llabs(s_rx_raw[i * 2 + 1] >> 8);
         }
     }
 
@@ -124,23 +127,22 @@ esp_err_t audio_io_read_microphone(
 {
     if (!pcm || samples != AUDIO_FRAME_SAMPLES) return ESP_ERR_INVALID_ARG;
 
-    int32_t raw[AUDIO_FRAME_SAMPLES * 2];
     size_t bytes = 0;
     ESP_RETURN_ON_ERROR(
         i2s_channel_read(
             s_rx_channel,
-            raw,
-            sizeof(raw),
+            s_rx_raw,
+            sizeof(s_rx_raw),
             &bytes,
             pdMS_TO_TICKS(1000)),
         TAG,
         "read microphone");
-    if (bytes != sizeof(raw)) return ESP_ERR_INVALID_SIZE;
+    if (bytes != sizeof(s_rx_raw)) return ESP_ERR_INVALID_SIZE;
 
     double sum_sq = 0.0;
     int16_t peak = 0;
     for (size_t i = 0; i < samples; ++i) {
-        int32_t sample = (raw[i * 2 + (s_use_right_channel ? 1 : 0)] >> 16);
+        int32_t sample = (s_rx_raw[i * 2 + (s_use_right_channel ? 1 : 0)] >> 16);
         if (sample > INT16_MAX) sample = INT16_MAX;
         if (sample < INT16_MIN) sample = INT16_MIN;
         const int32_t magnitude = abs((int)sample);
@@ -162,10 +164,9 @@ esp_err_t audio_io_write_speaker(const int16_t *mono, size_t samples)
 {
     if (!mono || samples > AUDIO_FRAME_SAMPLES) return ESP_ERR_INVALID_ARG;
 
-    int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
     for (size_t i = 0; i < samples; ++i) {
-        stereo[i * 2] = mono[i];
-        stereo[i * 2 + 1] = mono[i];
+        s_tx_stereo[i * 2] = mono[i];
+        s_tx_stereo[i * 2 + 1] = mono[i];
     }
 
     const size_t expected = samples * 2 * sizeof(int16_t);
@@ -173,7 +174,7 @@ esp_err_t audio_io_write_speaker(const int16_t *mono, size_t samples)
     ESP_RETURN_ON_ERROR(
         i2s_channel_write(
             s_tx_channel,
-            stereo,
+            s_tx_stereo,
             expected,
             &written,
             pdMS_TO_TICKS(1000)),
