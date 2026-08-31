@@ -15,6 +15,7 @@ services:
       WAKEWORD_LABEL: Hey Jarvis
       WAKEWORD_THRESHOLD: "0.50"
       WAKEWORD_ARM_SECONDS: "8"
+      SPEAKER_VOLUME_DEFAULT: "16"
     ports:
       - "8766:8766"
     networks:

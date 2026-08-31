@@ -1,6 +1,6 @@
 # Voice Satellite WebSocket protocol
 
-The application protocol is deliberately small. The ESP32-S3 is an input-only microphone satellite; all inference and speech processing live on the Pi.
+The application protocol is deliberately small. Transport semantics are delegated to RFC 6455 rather than reimplemented.
 
 ## Endpoint and authentication
 
@@ -9,7 +9,7 @@ Connect to `/ws/satellite` using:
 - WebSocket subprotocol: `voice-satellite.v1`
 - HTTP header: `Authorization: Bearer <satellite token>`
 
-A missing or invalid token is rejected before the WebSocket upgrade.
+A missing/invalid token is rejected before the WebSocket upgrade.
 
 ## Session negotiation
 
@@ -20,31 +20,43 @@ Immediately after the upgrade, the satellite sends a JSON text message:
   "type": "hello",
   "protocol": 1,
   "device": {"id": "xiao-s3-…", "firmware": "0.2.0"},
-  "capabilities": ["microphone"],
+  "capabilities": ["microphone", "speaker"],
   "audio_in": {
     "codec": "pcm_s16le",
-    "sample_rate": 16000,
+    "sample_rate": 22050,
     "channels": 1,
     "frame_ms": 20
   }
 }
 ```
 
-The receiver validates the format and replies with `ready` plus wake-word metadata. Unsupported versions or formats are closed rather than guessed.
+The receiver validates the format and replies with `ready`, including the negotiated speaker format, volume and wake-word mode. Unsupported versions/formats are closed rather than guessed.
 
 ## Binary media
 
-Binary messages flow only from the satellite to the receiver and contain microphone `pcm_s16le`, 16 kHz, mono audio.
+Binary messages are audio; direction determines the stream:
 
-The sender uses 20 ms (320-sample / 640-byte) messages for low latency. Receivers use WebSocket message boundaries rather than adding another length header.
+- satellite → receiver: microphone `pcm_s16le`, 22.05 kHz, mono
+- receiver → satellite: speaker `pcm_s16le`, 22.05 kHz, mono
+
+The current sender uses 20 ms (441-sample / 882-byte) messages for low latency. Receivers should use WebSocket message boundaries rather than inventing a second length header.
+
+Speaker binary messages only occur between `playback.start` and `playback.end` JSON events. The satellite may acknowledge completion with `playback.done`.
 
 ## Control events
 
+JSON text messages are extensible objects identified by `type`. Current messages are:
+
 | Direction | Type | Purpose |
 | --- | --- | --- |
-| ESP → Pi | `hello` | negotiate protocol and microphone format |
-| Pi → ESP | `ready` | accept session and report wake-word mode |
+| ESP → Pi | `hello` | negotiate protocol/capabilities |
+| Pi → ESP | `ready` | accept session and report output format |
 | ESP → Pi | `stats` | RSSI / firmware telemetry |
+| Pi → ESP | `volume` | set logical speaker volume |
+| Pi → ESP | `playback.start` | begin speaker PCM stream |
+| Pi → ESP | `playback.end` | finish speaker PCM stream |
+| Pi → ESP | `playback.cancel` | discard pending speaker audio |
+| ESP → Pi | `playback.done` | speaker queue drained |
 
 Normal WebSocket ping/pong is enabled by both implementations, so no application heartbeat is required.
 
