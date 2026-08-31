@@ -45,6 +45,16 @@ The receiver serves everything from port `8766`:
 
 See [PROTOCOL.md](PROTOCOL.md) for the small application message schema. WebSocket itself provides message boundaries, fragmentation, ping/pong, reconnect behavior and TCP backpressure; we do not layer our own lengths or line commands on top.
 
+## Code layout
+
+- `main/audio_io.*` owns duplex I2S configuration and PCM conversion. The
+  firmware orchestrator does not know about DMA layout or microphone slots.
+- `receiver/audio.py` owns the satellite and inference PCM formats, resampling,
+  metering, TTS decoding and software gain.
+- `receiver/speaker.py` owns serialized WebSocket playback, pacing,
+  cancellation and speaker state.
+- `receiver/server.py` owns wake/VAD and the STT → agent → TTS workflow.
+
 ## Audio pipeline
 
 ```text

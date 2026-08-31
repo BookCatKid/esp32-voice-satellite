@@ -1,4 +1,3 @@
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -6,8 +5,6 @@
 #include <string.h>
 
 #include "cJSON.h"
-#include "driver/i2s_std.h"
-#include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -21,6 +18,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "audio_io.h"
 #include "voice_satellite_config.h"
 #include "voice_satellite_secrets.h"
 
@@ -31,18 +29,14 @@ static const char *TAG = "voice-satellite";
 #define WS_OPCODE_TEXT      0x1
 #define WS_OPCODE_BINARY    0x2
 
-static i2s_chan_handle_t s_rx_chan;
-static i2s_chan_handle_t s_tx_chan;
 static EventGroupHandle_t s_events;
 static QueueHandle_t s_speaker_queue;
 static esp_websocket_client_handle_t s_ws;
-static bool s_use_right_channel = false;
 static volatile bool s_speaker_playing = false;
 static volatile bool s_playback_end_received = false;
-static volatile int s_speaker_volume = 16;
 static char s_playback_id[48];
 
-/* Server output is paced in 20 ms / 640 byte messages. Keep a small queue to
+/* Server output is paced in 20 ms / 882 byte messages. Keep a small queue to
  * absorb Wi-Fi scheduling jitter without adding a large speech delay. */
 typedef struct {
     size_t len;
@@ -89,82 +83,6 @@ static void connect_wifi(void)
     if (!(bits & WIFI_CONNECTED_BIT)) {
         ESP_LOGW(TAG, "Wi-Fi not connected yet; background reconnect will continue");
     }
-}
-
-static esp_err_t init_audio(void)
-{
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = AUDIO_FRAME_SAMPLES;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx_chan, &s_rx_chan), TAG, "allocate I2S duplex");
-
-    i2s_std_config_t rx_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE_HZ),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = MIC_I2S_BCLK_GPIO,
-            .ws = MIC_I2S_WS_GPIO,
-            .dout = I2S_GPIO_UNUSED,
-            .din = MIC_I2S_DATA_GPIO,
-            .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
-        },
-    };
-    rx_cfg.clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
-    rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx_chan, &rx_cfg), TAG, "configure I2S RX");
-
-    i2s_std_config_t tx_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE_HZ),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = SPEAKER_I2S_BCLK_GPIO,
-            .ws = SPEAKER_I2S_WS_GPIO,
-            .dout = SPEAKER_I2S_DATA_GPIO,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
-        },
-    };
-    tx_cfg.clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
-    tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
-    tx_cfg.slot_cfg.ws_width = 32;
-    tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx_chan, &tx_cfg), TAG, "configure I2S TX");
-
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx_chan), TAG, "enable I2S RX");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx_chan), TAG, "enable I2S TX");
-
-    ESP_LOGI(TAG, "INMP441: %d Hz BCLK=GPIO%d WS=GPIO%d SD=GPIO%d",
-             AUDIO_SAMPLE_RATE_HZ, MIC_I2S_BCLK_GPIO, MIC_I2S_WS_GPIO, MIC_I2S_DATA_GPIO);
-    ESP_LOGI(TAG, "MAX98357A: %d Hz BCLK=GPIO%d WS=GPIO%d DIN=GPIO%d",
-             AUDIO_SAMPLE_RATE_HZ, SPEAKER_I2S_BCLK_GPIO, SPEAKER_I2S_WS_GPIO, SPEAKER_I2S_DATA_GPIO);
-    return ESP_OK;
-}
-
-static void choose_mic_channel(void)
-{
-    enum { WORDS = AUDIO_FRAME_SAMPLES * 2 };
-    int32_t raw[WORDS];
-    uint64_t left_energy = 0, right_energy = 0;
-
-    for (int n = 0; n < 8; n++) {
-        size_t bytes = 0;
-        if (i2s_channel_read(s_rx_chan, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(1000)) != ESP_OK) {
-            continue;
-        }
-        size_t frames = bytes / (sizeof(int32_t) * 2);
-        for (size_t i = 0; i < frames; i++) {
-            int32_t l = raw[i * 2] >> 8;
-            int32_t r = raw[i * 2 + 1] >> 8;
-            left_energy += (uint64_t)llabs(l);
-            right_energy += (uint64_t)llabs(r);
-        }
-    }
-
-    s_use_right_channel = right_energy > left_energy;
-    ESP_LOGI(TAG, "Detected active microphone I2S channel: %s",
-             s_use_right_channel ? "right" : "left");
 }
 
 static bool websocket_send_json(cJSON *root)
@@ -251,15 +169,10 @@ static void handle_control_json(const char *data, size_t len)
 
     if (strcmp(type->valuestring, "ready") == 0) {
         const cJSON *protocol = cJSON_GetObjectItemCaseSensitive(root, "protocol");
-        const cJSON *volume = cJSON_GetObjectItemCaseSensitive(root, "volume");
         if (cJSON_IsNumber(protocol) && protocol->valueint == 1) {
-            if (cJSON_IsNumber(volume)) s_speaker_volume = volume->valueint;
             xEventGroupSetBits(s_events, WS_READY_BIT);
             ESP_LOGI(TAG, "WebSocket protocol ready (%s)", SATELLITE_WS_SUBPROTOCOL);
         }
-    } else if (strcmp(type->valuestring, "volume") == 0) {
-        const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, "value");
-        if (cJSON_IsNumber(value)) s_speaker_volume = value->valueint;
     } else if (strcmp(type->valuestring, "playback.start") == 0) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
         speaker_queue_reset();
@@ -381,15 +294,7 @@ static void speaker_task(void *arg)
             }
             size_t samples = frame.len / sizeof(int16_t);
             if (samples > AUDIO_FRAME_SAMPLES) samples = AUDIO_FRAME_SAMPLES;
-            const int16_t *mono = (const int16_t *)frame.data;
-            int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
-            for (size_t i = 0; i < samples; ++i) {
-                stereo[i * 2] = mono[i];
-                stereo[i * 2 + 1] = mono[i];
-            }
-            size_t written = 0;
-            esp_err_t err = i2s_channel_write(
-                s_tx_chan, stereo, samples * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(1000));
+            esp_err_t err = audio_io_write_speaker((const int16_t *)frame.data, samples);
             if (err != ESP_OK) ESP_LOGW(TAG, "Speaker I2S write failed: %s", esp_err_to_name(err));
         } else if (s_speaker_playing && s_playback_end_received && uxQueueMessagesWaiting(s_speaker_queue) == 0) {
             s_speaker_playing = false;
@@ -405,8 +310,6 @@ static void speaker_task(void *arg)
 
 static void microphone_task(void *arg)
 {
-    enum { RAW_WORDS = AUDIO_FRAME_SAMPLES * 2 };
-    int32_t raw[RAW_WORDS];
     int16_t pcm[AUDIO_FRAME_SAMPLES];
     int64_t last_meter = 0;
     int64_t last_stats = 0;
@@ -418,25 +321,10 @@ static void microphone_task(void *arg)
             continue;
         }
 
-        size_t bytes = 0;
-        esp_err_t err = i2s_channel_read(s_rx_chan, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(1000));
+        audio_level_t level = {0};
+        esp_err_t err = audio_io_read_microphone(
+            pcm, AUDIO_FRAME_SAMPLES, s_speaker_playing, &level);
         if (err != ESP_OK) continue;
-        size_t frames = bytes / (sizeof(int32_t) * 2);
-        if (frames != AUDIO_FRAME_SAMPLES) continue;
-
-        double sum_sq = 0.0;
-        int16_t peak = 0;
-        for (size_t i = 0; i < frames; i++) {
-            int32_t sample24 = raw[i * 2 + (s_use_right_channel ? 1 : 0)] >> 8;
-            int32_t sample16 = sample24 >> 8;
-            if (sample16 > INT16_MAX) sample16 = INT16_MAX;
-            if (sample16 < INT16_MIN) sample16 = INT16_MIN;
-            int32_t a = abs((int)sample16);
-            if (a > peak) peak = a;
-            sum_sq += (double)sample16 * sample16;
-            /* Until we add AEC, prevent the assistant from hearing its own TTS. */
-            pcm[i] = s_speaker_playing ? 0 : (int16_t)sample16;
-        }
 
         int sent = esp_websocket_client_send_bin(
             s_ws, (const char *)pcm, sizeof(pcm), pdMS_TO_TICKS(1000));
@@ -448,10 +336,8 @@ static void microphone_task(void *arg)
 
         int64_t now = esp_timer_get_time();
         if (now - last_meter >= 1000000) {
-            double rms = sqrt(sum_sq / frames);
-            double dbfs = 20.0 * log10(fmax(rms, 1.0) / 32767.0);
             ESP_LOGI(TAG, "mic=%s level=%.1f dBFS peak=%d ws=ready speaker=%s",
-                     s_use_right_channel ? "right" : "left", dbfs, peak,
+                     audio_io_microphone_channel(), level.dbfs, level.peak,
                      s_speaker_playing ? "playing" : "idle");
             last_meter = now;
         }
@@ -481,8 +367,8 @@ void app_main(void)
     ESP_ERROR_CHECK((s_events && s_speaker_queue) ? ESP_OK : ESP_ERR_NO_MEM);
 
     connect_wifi();
-    ESP_ERROR_CHECK(init_audio());
-    choose_mic_channel();
+    ESP_ERROR_CHECK(audio_io_init());
+    audio_io_detect_microphone_channel();
     start_websocket();
 
     xTaskCreatePinnedToCore(microphone_task, "microphone", 7168, NULL, 7, NULL, 1);
