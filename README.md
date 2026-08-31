@@ -76,6 +76,10 @@ pio run -e xiao_esp32s3 -t upload
 pio device monitor -p /dev/cu.usbmodem101 -b 115200
 ```
 
+The exact standalone speaker configuration verified on the target hardware is
+preserved in `hardware-tests/speaker-smoke/`. Keep it as a known-good fallback
+when changing the production duplex audio path.
+
 ## Pi receiver
 
 The deployed service is mirrored in `receiver/` and runs as the `voice-satellite` Docker container on the Pi. Rebuild with:
